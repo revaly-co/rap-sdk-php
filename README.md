@@ -1,0 +1,247 @@
+# Revaly RAP SDK for PHP
+
+The official PHP SDK for the RAP V2 API (`api.revaly.co`): payments, payment methods,
+transactions, and notify — with a **merchant-facing failover contract** built in. One
+package (`revaly/sdk`), one import namespace (`Revaly\Sdk`); the generated API core
+ships inside it as `Revaly\Sdk\Core`.
+
+> **Install:** `composer require revaly/sdk` — published on Packagist (served from the
+> generated read-only mirror `revaly-co/rap-sdk-php`). GitHub release artifacts remain
+> the provenance anchor and fallback channel.
+
+Requires PHP 8.1+ with `ext-curl`, `ext-json`, `ext-mbstring`; HTTP via Guzzle 7.
+
+## Why the error classes matter (read this first)
+
+A failed `POST /payments` does **not** mean the payment didn't happen. If you blindly
+fail over to your own gateway on an ambiguous failure, the cardholder can be charged
+**twice**. Every payment operation on `RapClient` therefore throws exactly one of three
+typed failure classes, and the class — never the message text, never latency — is what
+licenses failover:
+
+| Exception | Meaning | What you do |
+| --- | --- | --- |
+| `PermanentRejectionException` | Received and rejected (400/401/404/422, or a 403 without the edge marker) | Fix or decline — failing over reproduces the same rejection anywhere. |
+| `TransientFailureException` | **Definitively not processed** (provably never sent, `503` + `code: not_processed`, or a `403` blocked at the edge firewall — `isEdgeRejection()`) | Route to your own gateway immediately. On an edge rejection, charge/authorize may also fix the request content and retry; capture/void/refund/refund-cancel retry the same request. Quote `getEdgeReference()` to support. |
+| `OutcomeUnknownException` | **May have been processed** (timeout after send, 500/502/504, bare 503, reset) | **Reconcile before acting** — see the quickstart. |
+
+## Quickstart (sandbox key → first charge, ≤ 15 minutes)
+
+Install:
+
+```bash
+composer require revaly/sdk
+```
+
+Charge a payment and handle **all three** failure classes — the failover + reconcile
+example is part of the quickstart because it is the safety-critical path:
+
+```php
+<?php
+
+use Revaly\Sdk\Core\Model\CreditCard;
+use Revaly\Sdk\Core\Model\PaymentMethod;
+use Revaly\Sdk\Core\Model\PaymentRequest;
+use Revaly\Sdk\Errors\OutcomeUnknownException;
+use Revaly\Sdk\Errors\PermanentRejectionException;
+use Revaly\Sdk\Errors\TransientFailureException;
+use Revaly\Sdk\RapClient;
+use Revaly\Sdk\Reconcile\Found;
+use Revaly\Sdk\Reconcile\NotFoundYet;
+use Revaly\Sdk\Reconcile\RapTransactionOutcome;
+use Revaly\Sdk\Reconcile\ReconcilePolicy;
+
+$client = new RapClient(
+    // Enablement-issued sandbox-scoped key, sent as `Authorization: ApiKey <key>`.
+    // Sandbox and live share the same URL — your key's scope selects the environment
+    // (there is no separate sandbox host).
+    apiKey: getenv('REVALY_API_KEY'),
+);
+
+$request = new PaymentRequest();
+$request->setAmount(1999);                     // smallest currency unit (cents)
+$request->setCurrency('USD');
+$request->setMerchantTransactionId('order-1042-attempt-1'); // required — reconcile key
+// orderId + email: the sandbox simulator requires both for an approval.
+$request->setOrderId('order-1042');
+
+$card = new CreditCard();
+$card->setNumber('4111111111111111');          // sandbox test card
+$card->setExpiryMonth('12');
+$card->setExpiryYear('2030');
+$card->setCardVerificationCode('123');
+
+$method = new PaymentMethod();
+$method->setFullName('Ada Lovelace');          // creditCard requires a cardholder name
+$method->setEmail('ada@example.com');
+$method->setCreditCard($card);
+$request->setPaymentMethod($method);           // paymentMethodType is omitted —
+                                               // inferred from the one populated method object
+
+try {
+    $transaction = $client->charge($request);
+    echo "approved: {$transaction->getTransactionId()}\n";
+    // $transaction->getPaymentMethod()?->getVaultToken() (spec >= 2.4.0) ties this charge
+    // back to the stored credential it ran against — set only when a vault credential was
+    // used, and it may reflect an Account Updater roll. Treat it as optional; absence
+    // proves nothing.
+} catch (PermanentRejectionException $e) {
+    // Fix or decline — failing over reproduces the same rejection anywhere.
+    echo "rejected [{$e->getStatusCode()}]: {$e->getApiError()} (ref {$e->getCorrelationId()})\n";
+} catch (TransientFailureException $e) {
+    // Definitively not processed — route to your own gateway immediately.
+    // $e->isEdgeRejection(): the edge firewall blocked the request before it reached the
+    // platform; $e->getEdgeReference() identifies that firewall decision for support.
+    // Charge/authorize: fail over (or fix the content and retry);
+    // capture/void/refund/refund-cancel: retry the same request.
+    chargeOnFallbackGateway($request);
+} catch (OutcomeUnknownException $e) {
+    // May have been processed — reconcile BEFORE acting (double-charge hazard).
+    $verdict = $client->reconcile(
+        $request->getMerchantTransactionId(),
+        new ReconcilePolicy(
+            maxAttempts: 5,
+            overallBudgetSeconds: 30.0,
+            initialDelaySeconds: 1.0,   // doubles each attempt, ±20% jitter
+        ),
+    );
+
+    if ($verdict instanceof Found) {
+        match ($verdict->getOutcome()) {
+            RapTransactionOutcome::Approved => acknowledgeSuccess($verdict->getTransaction()),
+            RapTransactionOutcome::Declined,
+            RapTransactionOutcome::Error => decideOnFallbackPerYourRiskPolicy(),
+            // Pending, Unknown, and future outcomes: hold conservatively.
+            default => holdAndEscalate($verdict),
+        };
+    } elseif ($verdict instanceof NotFoundYet) {
+        // NOT proof of absence — platform visibility is asynchronous and widest
+        // exactly when RAP-core is degraded. Hold and escalate per your policy.
+        holdAndEscalate($verdict);
+    } else {
+        // Default branch — REQUIRED. Verdicts are open for extension: SafeToFailover
+        // arrives with platform P-2 as a minor release.
+        holdAndEscalate($verdict);
+    }
+}
+```
+
+`reconcile()` is GET-only and side-effect-free, so it is always safe to call again; its
+bounds are yours to set (`ReconcilePolicy` ships no defaults, because the right budget is
+your checkout's). On sustained `NotFoundYet`, escalate per your risk policy: V1's verdict
+set is exactly what the platform can prove today, and `SafeToFailover` arrives with
+platform P-2 as a minor release.
+
+### Timeouts
+
+`overallDeadline` defaults to **75 seconds** — ratified from production latency
+telemetry (ADR-SDK-027): it clears every observed gateway tail cluster (the worst
+non-hung tail seen in 14 fleet days was 64 s), clips ≲0.007% of charges, and still
+classifies well before the platform's own ≈100 s ceiling. Tighten it per your checkout
+budget (RAP routes gateways server-side, so the default must cover the slowest common
+class), or pass an explicit `overallDeadline: null` to disable the SDK deadline.
+`connectTimeout` defaults to **10 seconds** — ratified from the OQ-11 edge verification
+(ADR-SDK-029): roughly 25× the observed cold client→edge TLS envelope, and 65 s below
+the overall deadline. Pass an explicit `connectTimeout: null` to disable the SDK
+connect bound. One PHP-specific caveat: curl reports connect-phase timeouts and
+after-send deadline expiry with the **same error** (errno 28), so this SDK classifies
+**every timeout as `OutcomeUnknown`** (reconcile), never as safe-to-failover — it
+cannot prove the request was never sent. Provable never-sent (connection refused, DNS,
+TLS handshake) still classifies `TransientFailureException`.
+
+### API versioning
+
+The client pins `X-Api-Version: 2.1` by default; `2.0` is selectable
+(`apiVersion: '2.0'`). **Behavioural difference on 2.0:** the `ErrorResponse.code`
+field is not part of the 2.0 documented contract, so `503` + `code: not_processed`
+classifies as `OutcomeUnknown` (reconcile) instead of `TransientFailureException`
+(immediate failover). Pin 2.1 unless you have a frozen 2.0 integration. The edge-rejection
+marker is honoured on both pins (ADR-SDK-033): the edge sits in front of the API.
+
+## Testing your failover handler — no network
+
+`RapMockTransport` scripts every row of the failure taxonomy, so your failover handler
+is unit-testable with no network and **synthetic data only**:
+
+```php
+use Revaly\Sdk\RapClient;
+use Revaly\Sdk\Testing\RapMockTransport;
+
+$mock = new RapMockTransport();
+$mock->charge()->returnsNotProcessed503();          // TransientFailure: fail over now
+$mock->reconcile('order-1042-attempt-1')
+    ->notFoundYet(2)                                // two 404s...
+    ->thenFoundApproved();                          // ...then the record appears
+
+$client = new RapClient(apiKey: 'sk-test-synthetic', transport: $mock);
+
+// Drive your handler; then assert what it did:
+$requests = $mock->getRequests();                   // recorded, with headers
+```
+
+Scenario methods cover the whole §2 table: `returnsPermanentRejection(422)`,
+`returnsNotProcessed503()`, `returnsEdgeRejection403()` (the edge firewall's marker body
+served as `text/html` → `TransientFailureException` with `isEdgeRejection()`), its negative
+controls `returnsEdgeHtmlPage403()` / `returnsPlatformForbidden403()` (→
+`PermanentRejectionException`), `throwsConnectionRefused()`, `throwsDnsFailure()`,
+`throwsSslHandshakeFailure()`, `returnsBare503()`, `returnsServerError()`,
+`returnsBadGateway()`, `returnsGatewayTimeout()`, `throwsTimeoutAfterSend()`,
+`throwsConnectTimeout()`, `throwsConnectionReset()`, plus reconcile scripting
+(`notFoundYet()`, `pending()`, `thenFoundApproved()`, `thenFoundDeclined()`) and raw
+escapes (`returns()`, `throwsIo()`).
+
+## Logging & debugging
+
+- Pass any PSR-3 `logger`. **Default output is values-free**: operation, HTTP status,
+  failure class, and correlation id — never payload values, never the API key.
+- Debug level carries payloads scrubbed by a central **allowlist** (only known-safe
+  identifier/status fields survive; PAN/CVV/PII cannot appear).
+- Every response and every typed error carries the **`X-Correlation-ID`** — quote it in
+  support tickets; it joins your request directly to platform telemetry.
+- `wireTraceHook` receives a scrubbed request/response observer (`RapWireTrace`) for
+  escalations; observer exceptions are swallowed.
+
+## Design guarantees
+
+The SDK's job is to tell you, honestly, which failure class you are in. Failover execution
+belongs to your code, against your risk policy.
+
+- **Each charge is sent exactly once** — redirects are not followed, so a `307` on
+  `POST /payments` arrives as a response to classify rather than a silent re-send.
+- **Every call stands alone** — no cross-request state, no circuit breaker, so behaviour
+  under load is the behaviour you tested.
+- **The reconcile poll you bound is the only loop the SDK owns.**
+- **Classification rests on evidence only**: HTTP status, `ErrorResponse.code`, and on a
+  403 the single `details.edgeRejection` key (ADR-SDK-033). Message text and latency are
+  reported to you and excluded from the verdict.
+- **Recovery beyond this boundary belongs to RAP-core** — resubmission and
+  `bypassPlatform` are platform-internal, so a payment's outcome stays unambiguous.
+
+Normative form: [`docs/failover-contract.md`](https://github.com/revaly-co/RAP-sdk/blob/main/docs/failover-contract.md) §5 and
+Appendix A.
+
+## Beyond payments
+
+The full generated V2 surface is available through the same client and transport:
+`$client->payments()`, `$client->transactions()`, `$client->paymentMethods()`,
+`$client->notifyApi()`. One note on the transactions lookups: the generated 200-response
+wrappers merge all response variants (terminal / pending / grouped) into one flattened
+class without discrimination — check the discriminating field yourself (`state` is
+present only on pending records), or prefer `$client->reconcile()`, which classifies
+from the raw body.
+
+One logging caution on this surface: raw core operations throw the generator's
+`ApiException`, not the three typed classes — its message can embed a response-body
+summary (via Guzzle) and `getResponseBody()` returns the body raw. Response bodies can
+contain PII (names, emails, masked card data): never log raw core exception messages or
+bodies; log the correlation id and the typed runtime errors (values-free by design)
+instead.
+
+## Where to go next
+
+- [Failover cookbook](https://github.com/revaly-co/RAP-sdk/blob/main/docs/failover-cookbook.md) — recipes for each outcome, choosing a
+  reconcile policy, testing offline, debugging with correlation ids.
+- [Failover contract](https://github.com/revaly-co/RAP-sdk/blob/main/docs/failover-contract.md) — the normative specification, with
+  sequence diagrams and the verbatim prohibitions in Appendix A.
+- [AGENTS.md](https://github.com/revaly-co/RAP-sdk/blob/main/AGENTS.md) — the whole contract on one page, for AI coding agents.
+- [Support](https://github.com/revaly-co/RAP-sdk/blob/main/SUPPORT.md) · [Contributing](https://github.com/revaly-co/RAP-sdk/blob/main/CONTRIBUTING.md) · [Security](https://github.com/revaly-co/RAP-sdk/blob/main/SECURITY.md)
